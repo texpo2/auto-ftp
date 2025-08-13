@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(terraform:*)",
+      "Bash(mv:*)",
+      "Bash(set MSYS_NO_PATHCONV=1)",
+      "Bash(mkdir:*)",
+      "mcp__ide__getDiagnostics",
+      "Bash(az account:*)",
+      "Bash(az vm list-usage:*)",
+      "Bash(az storage account list:*)",
+      "Bash(az keyvault list:*)",
+      "Bash(az provider list:*)",
+      "Bash(az vm list-sizes:*)",
+      "Bash(az backup vault list:*)",
+      "Bash(az network vnet list:*)",
+      "Bash(az group show:*)",
+      "Bash(az group:*)",
+      "Bash(az storage account check-name:*)",
+      "Bash(az role assignment list:*)",
+      "Bash(az keyvault check-name:*)",
+      "Bash(ssh:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

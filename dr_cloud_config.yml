@@ -1,0 +1,249 @@
+#cloud-config
+# DR(Disaster Recovery) 서버 전용 Cloud-Init 설정
+# 메인 서버 장애 시 자동으로 활성화되는 대기 상태 FTP 서버
+
+# 부트 명령 (가장 먼저 실행) - DNS 설정
+bootcmd:
+  - echo "nameserver 168.63.129.16" > /etc/resolv.conf
+  - echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+  - echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+  - echo "options timeout:2 attempts:3" >> /etc/resolv.conf
+
+# 패키지 업데이트 설정 (DR은 빠른 시작을 위해 최소화)
+package_update: true
+package_upgrade: false
+package_reboot_if_required: false
+
+# 필수 패키지 설치 (DR 전용 최소 패키지)
+packages:
+  - epel-release
+  - firewalld
+  - curl
+  - wget
+  - rsync
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+
+# 파일 생성
+write_files:
+  # DR 모드 식별 파일
+  - path: /etc/dr-mode
+    content: |
+      DR_MODE=${dr_mode}
+      PRIMARY_SERVER=${primary_ftp_server}
+      MAIN_REGION=${main_region}
+      DR_REGION=${dr_region}
+      ACTIVATED_AT=$(date)
+      STATUS=standby
+    permissions: "0644"
+
+  # DR 서버 활성화 스크립트
+  - path: /opt/dr_activate.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+
+      LOG="/var/log/dr-activation.log"
+      exec > >(tee -a $LOG) 2>&1
+
+      echo "$(date): DR 서버 활성화 시작"
+
+      # DR 모드 파일 업데이트
+      sed -i 's/STATUS=standby/STATUS=active/' /etc/dr-mode
+      echo "ACTIVATED_AT=$(date)" >> /etc/dr-mode
+
+      # 메인 서버 상태 확인
+      if ping -c 3 ${primary_ftp_server} >/dev/null 2>&1; then
+        echo "$(date): 경고: 메인 서버가 여전히 응답 중입니다!"
+      else
+        echo "$(date): 메인 서버 장애 확인됨. DR 모드 활성화 진행"
+      fi
+
+      # Docker 서비스 시작
+      systemctl enable docker
+      systemctl start docker
+
+      # FTP 데이터 동기화 (최신 백업에서 복원)
+      echo "$(date): DR 데이터 복원 시작"
+      mkdir -p /opt/ftp/{data,logs,config,certs}
+
+      # 백업된 데이터 복원 (Azure Storage에서)
+      # TODO: Azure CLI 또는 azcopy를 사용한 데이터 복원 로직
+
+      # DR FTP 서버 시작
+      echo "$(date): DR FTP 서버 시작"
+      /opt/setup_dr_ftp.sh
+
+      # 상태 업데이트
+      echo "DR_FULLY_ACTIVE=true" >> /etc/dr-mode
+      echo "$(date): DR 서버 활성화 완료"
+
+  # DR FTP 서버 설정 스크립트
+  - path: /opt/setup_dr_ftp.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+
+      LOG="/var/log/dr-ftp-setup.log"
+      exec > >(tee -a $LOG) 2>&1
+
+      echo "$(date): DR FTP 서버 설정 시작"
+
+      # 기존 FTP 컨테이너 정리
+      docker stop dr-ftp-server 2>/dev/null || true
+      docker rm dr-ftp-server 2>/dev/null || true
+
+      # FTP 디렉토리 설정
+      mkdir -p /opt/ftp/{data,logs,config,certs}
+      cd /opt/ftp
+
+      # SSL 인증서 생성 (DR 전용)
+      openssl req -x509 -nodes -days 365 -newkey rsa:4096 \
+        -keyout certs/vsftpd.key \
+        -out certs/vsftpd.pem \
+        -subj "/C=KR/ST=Seoul/L=Seoul/O=Team2-DR/OU=DR-Security/CN=dr-ftpserver.local"
+
+      chmod 600 certs/vsftpd.key
+      chmod 644 certs/vsftpd.pem
+
+      # DR 공인 IP 조회
+      DR_PUBLIC_IP=$(curl -s ifconfig.me || echo "127.0.0.1")
+
+      # DR FTP 컨테이너 실행
+      docker run -d \
+        --name dr-ftp-server \
+        --restart always \
+        -p 21:21 \
+        -p 30000-30010:30000-30010 \
+        -v /opt/ftp/data:/home/ftpuser \
+        -v /opt/ftp/logs:/var/log/vsftpd \
+        -e FTP_USER=ftpuser \
+        -e FTP_PASS=SecureFTP2024! \
+        -e PASV_ADDRESS="$DR_PUBLIC_IP" \
+        -e PASV_MIN_PORT=30000 \
+        -e PASV_MAX_PORT=30010 \
+        -e LOG_STDOUT=YES \
+        fauria/vsftpd
+
+      # DR 접속 정보 생성
+      cat > /opt/ftp/dr-credentials.txt <<EOF
+      DR FTP 서버 접속 정보 (장애 복구 모드)
+      =====================================
+      서버: $DR_PUBLIC_IP
+      포트: 21 (FTP)
+      사용자: ftpuser
+      비밀번호: SecureFTP2024!
+      패시브 포트: 30000-30010
+      보안: FTPS (SSL/TLS)
+      모드: DR Active
+      =====================================
+      활성화 일시: $(date)
+      
+      주의사항:
+      - 이는 재해 복구 서버입니다
+      - 메인 서버 복구 후 다시 대기 모드로 전환됩니다
+      - 긴급 상황에서만 사용하세요
+      EOF
+
+      chmod 600 /opt/ftp/dr-credentials.txt
+
+      echo "$(date): DR FTP 서버 설정 완료"
+
+  # DR 헬스 체크 스크립트
+  - path: /opt/dr_health_check.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      
+      LOG="/var/log/dr-health-check.log"
+      
+      # DR 상태 확인
+      if [ ! -f /etc/dr-mode ]; then
+        echo "$(date): DR 모드 파일이 없습니다" >> $LOG
+        exit 1
+      fi
+      
+      source /etc/dr-mode
+      
+      # 메인 서버 상태 확인
+      if ping -c 3 ${primary_ftp_server} >/dev/null 2>&1; then
+        echo "$(date): 메인 서버 정상 - DR 대기 모드 유지" >> $LOG
+        
+        # DR 서버가 활성 상태라면 대기 모드로 전환
+        if [ "$STATUS" = "active" ]; then
+          echo "$(date): 메인 서버 복구됨. DR 서버를 대기 모드로 전환" >> $LOG
+          /opt/dr_deactivate.sh
+        fi
+      else
+        echo "$(date): 메인 서버 장애 감지" >> $LOG
+        
+        # DR 서버가 대기 상태라면 활성화
+        if [ "$STATUS" = "standby" ]; then
+          echo "$(date): DR 서버 자동 활성화 시작" >> $LOG
+          /opt/dr_activate.sh
+        fi
+      fi
+
+  # DR 비활성화 스크립트
+  - path: /opt/dr_deactivate.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+
+      LOG="/var/log/dr-deactivation.log"
+      exec > >(tee -a $LOG) 2>&1
+
+      echo "$(date): DR 서버 비활성화 시작"
+
+      # DR FTP 서버 중지
+      docker stop dr-ftp-server 2>/dev/null || true
+
+      # DR 모드 파일 업데이트
+      sed -i 's/STATUS=active/STATUS=standby/' /etc/dr-mode
+      echo "DEACTIVATED_AT=$(date)" >> /etc/dr-mode
+
+      echo "$(date): DR 서버 비활성화 완료 - 대기 모드로 전환"
+
+# SSH 설정 (DR 관리용)
+ssh_pwauth: true
+disable_root: false
+
+# 비밀번호 설정
+chpasswd:
+  list: |
+    root:DR-SecureRoot2024!
+    azureuser:It12345!
+  expire: false
+
+# 실행 명령
+runcmd:
+  # 방화벽 설정
+  - systemctl enable firewalld
+  - systemctl start firewalld
+  - firewall-cmd --permanent --add-port=21/tcp
+  - firewall-cmd --permanent --add-port=22/tcp
+  - firewall-cmd --permanent --add-port=30000-30010/tcp
+  - firewall-cmd --reload
+
+  # Docker 설치 및 시작
+  - systemctl enable docker
+  - systemctl start docker
+
+  # DR 헬스 체크 크론 작업 설정 (5분마다)
+  - echo "*/5 * * * * root /opt/dr_health_check.sh" >> /etc/crontab
+
+  # DR 상태 로그 설정
+  - mkdir -p /var/log/dr
+  - touch /var/log/dr/status.log
+  - echo "$(date): DR 서버 초기화 완료 - 대기 모드" >> /var/log/dr/status.log
+
+  # 대기 모드에서는 비용 절약을 위해 불필요한 서비스 중지
+  - systemctl disable bluetooth 2>/dev/null || true
+  - systemctl disable cups 2>/dev/null || true
+
+# 최종 메시지
+final_message: "DR 서버 초기화 완료! 현재 대기 모드입니다. 메인 서버 장애 시 자동으로 활성화됩니다. DR 상태는 /var/log/dr/status.log에서 확인 가능합니다."
