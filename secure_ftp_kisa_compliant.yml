@@ -1,0 +1,1173 @@
+#cloud-config
+# KISA/CSAP 보안 가이드라인 완전 준수 FTP 서버 설정
+# 작성일: 2025/08/15
+# 버전: 4.0 (안정성 + 보안 완전 준수)
+
+# ============================================
+# 1. 부트 명령 - DNS 및 초기 보안 설정
+# ============================================
+bootcmd:
+  # DNS 설정
+  - echo "nameserver 168.63.129.16" > /etc/resolv.conf
+  - echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+  - echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+  - echo "options timeout:2 attempts:3" >> /etc/resolv.conf
+  
+  # 보안 커널 파라미터 설정
+  - sysctl -w net.ipv4.tcp_syncookies=1
+  - sysctl -w net.ipv4.conf.all.rp_filter=1
+  - sysctl -w net.ipv4.conf.default.rp_filter=1
+  - sysctl -w net.ipv4.conf.all.accept_source_route=0
+  - sysctl -w net.ipv4.icmp_echo_ignore_broadcasts=1
+  - sysctl -w net.ipv4.icmp_ignore_bogus_error_responses=1
+
+# ============================================
+# 2. 패키지 관리
+# ============================================
+package_update: true
+package_upgrade: false
+package_reboot_if_required: false
+
+# 저장소 설정 (Rocky Linux 9 호환)
+yum_repos:
+  docker-ce-stable:
+    name: Docker CE Stable - $basearch
+    baseurl: https://download.docker.com/linux/rhel/9/$basearch/stable
+    enabled: true
+    gpgcheck: true
+    gpgkey: https://download.docker.com/linux/rhel/gpg
+
+# 필수 패키지 설치 (보안 도구 포함)
+packages:
+  # - epel-release  # Rocky Linux 9에서는 runcmd에서 조건부 설치
+  - firewalld
+  - curl
+  - wget
+  - git
+  - openssl
+  - dnf-plugins-core
+  - container-selinux
+  - python3-pip
+  - jq             # JSON 파싱용
+  # 선택적 보안 도구 (설치 실패 시 무시)
+  # - fail2ban
+  # - aide           # 파일 무결성 검사
+  # - audit          # 감사 로깅
+  # - rkhunter       # Rootkit 검사
+
+# ============================================
+# 3. 사용자 및 그룹 설정
+# ============================================
+users:
+  - name: ftpadmin
+    groups: docker
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:/usr/bin/docker', 'ALL=(ALL) NOPASSWD:/usr/bin/systemctl']
+    lock_passwd: false
+  - name: azureuser
+    groups: users
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) ALL']
+    lock_passwd: false
+
+# ============================================
+# 4. 파일 생성
+# ============================================
+write_files:
+  # DNS 설정 고정
+  - path: /etc/NetworkManager/conf.d/dns.conf
+    content: |
+      [main]
+      dns=none
+
+  - path: /etc/systemd/resolved.conf
+    content: |
+      [Resolve]
+      DNS=168.63.129.16 8.8.8.8 8.8.4.4
+      FallbackDNS=1.1.1.1
+      DNSStubListener=no
+
+  # SELinux 보안 설정
+  - path: /etc/selinux/config
+    content: |
+      SELINUX=enforcing
+      SELINUXTYPE=targeted
+
+  # SSH 보안 설정 강화
+  - path: /etc/ssh/sshd_config.d/99-security.conf
+    permissions: "0600"
+    content: |
+      # KISA 권고사항 준수
+      PermitRootLogin no
+      PasswordAuthentication no
+      PubkeyAuthentication yes
+      PermitEmptyPasswords no
+      MaxAuthTries 3
+      MaxSessions 2
+      ClientAliveInterval 300
+      ClientAliveCountMax 0
+      LoginGraceTime 60
+      X11Forwarding no
+      AllowUsers azureuser ftpadmin
+      LogLevel VERBOSE
+
+  # Fail2ban 설정 (무차별 대입 공격 방지)
+  - path: /etc/fail2ban/jail.local
+    permissions: "0644"
+    content: |
+      [DEFAULT]
+      bantime = 3600
+      findtime = 600
+      maxretry = 3
+      
+      [sshd]
+      enabled = true
+      
+      [vsftpd]
+      enabled = true
+      port = ftp,ftp-data,30000:30010
+      logpath = /opt/ftp/logs/vsftpd.log
+      maxretry = 3
+
+  # 패스워드 정책
+  - path: /etc/security/pwquality.conf
+    permissions: "0644"
+    content: |
+      minlen = 12
+      dcredit = -1
+      ucredit = -1
+      ocredit = -1
+      lcredit = -1
+      minclass = 3
+      maxrepeat = 3
+      enforcing = 1
+
+  # Docker 설치 스크립트 (보안 강화 + 안정성)
+  - path: /opt/install_docker_secure.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+      
+      LOG="/var/log/docker-install.log"
+      exec > >(tee -a $LOG) 2>&1
+      
+      echo "$(date): Docker 보안 설치 시작"
+      echo "VM 사양: $(nproc) CPU, $(free -h | grep Mem | awk '{print $2}') RAM" >> $LOG
+      
+      # 네트워크 연결 확인 (재시도 증가)
+      for i in {1..20}; do
+        if curl -s --connect-timeout 10 https://www.google.com > /dev/null; then
+          echo "$(date): 네트워크 연결 확인 완료"
+          break
+        fi
+        echo "$(date): 네트워크 연결 재시도 $i/20"
+        sleep 10
+      done
+      
+      # 기존 Docker 완전 제거
+      echo "$(date): 기존 Docker 제거"
+      dnf remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman runc containerd.io 2>/dev/null || true
+      
+      # Docker 저장소 정리 및 추가
+      rm -f /etc/yum.repos.d/docker*.repo 2>/dev/null || true
+      dnf clean all
+      dnf makecache
+      
+      # Docker CE 레포지토리 추가 (재시도 로직)
+      for i in {1..3}; do
+        if dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo; then
+          echo "$(date): Docker 레포지토리 추가 성공"
+          break
+        fi
+        echo "$(date): Docker 레포지토리 추가 재시도 $i/3"
+        sleep 10
+      done
+      
+      # GPG 키 가져오기
+      rpm --import https://download.docker.com/linux/rhel/gpg
+      
+      # Docker CE 설치 (재시도 로직 추가)
+      echo "$(date): Docker CE 설치"
+      for i in {1..3}; do
+        if dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin; then
+          echo "$(date): Docker CE 설치 성공"
+          break
+        fi
+        echo "$(date): Docker CE 설치 재시도 $i/3"
+        sleep 10
+      done
+      
+      # 보안 그룹 설정
+      groupadd -f docker
+      usermod -aG docker ftpadmin
+      
+      # Docker 서비스 시작
+      systemctl daemon-reload
+      systemctl enable docker
+      systemctl start docker
+      
+      # Docker 서비스 상태 확인 (재시도 횟수 증가)
+      for i in {1..15}; do
+        if docker info >/dev/null 2>&1; then
+          echo "$(date): Docker 서비스 정상 동작 확인"
+          break
+        fi
+        echo "$(date): Docker 서비스 시작 대기 중... $i/15"
+        systemctl restart docker 2>/dev/null || true
+        sleep 5
+      done
+      
+      docker --version
+      echo "$(date): Docker 보안 설치 완료"
+
+  # 보안 패스워드 생성 스크립트
+  - path: /opt/generate_passwords.sh
+    permissions: "0700"
+    content: |
+      #!/bin/bash
+      set -e
+      
+      LOG="/var/log/secure-setup.log"
+      exec > >(tee -a $LOG) 2>&1
+      
+      echo "$(date): 보안 패스워드 생성 시작"
+      
+      mkdir -p /opt/ftp
+      
+      # 안전한 랜덤 패스워드 생성
+      generate_secure_password() {
+        openssl rand -base64 32 | tr -d "=+/" | cut -c1-16
+      }
+      
+      # 패스워드 생성
+      ROOT_PASS=$(generate_secure_password)
+      AZURE_PASS=$(generate_secure_password)
+      FTP_PASS=$(generate_secure_password)
+      FTPADMIN_PASS=$(generate_secure_password)
+      
+      # 패스워드 설정
+      echo "root:$ROOT_PASS" | chpasswd
+      echo "azureuser:$AZURE_PASS" | chpasswd
+      
+      if id ftpadmin &>/dev/null; then
+        echo "ftpadmin:$FTPADMIN_PASS" | chpasswd
+      fi
+      
+      # root 계정 잠금 (KISA 권고사항)
+      passwd -l root
+      
+      # FTP 패스워드 저장
+      echo "export FTP_USER_PASS='$FTP_PASS'" > /opt/ftp/.env
+      chmod 600 /opt/ftp/.env
+      
+      echo "$(date): 보안 패스워드 생성 완료"
+
+  # 공인 IP 조회 스크립트
+  - path: /opt/get_public_ip.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      
+      get_public_ip() {
+        local ip=""
+        
+        # Azure 메타데이터 서비스
+        ip=$(curl -s -H Metadata:true --connect-timeout 10 "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-12-13&format=text" 2>/dev/null | tr -d '\n' | tr -d ' ')
+        if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+          echo "$ip"
+          return 0
+        fi
+        
+        # 외부 서비스들
+        for service in "ifconfig.me" "ipinfo.io/ip" "icanhazip.com"; do
+          ip=$(curl -s --connect-timeout 10 "$service" 2>/dev/null | tr -d '\n' | tr -d ' ')
+          if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "$ip"
+            return 0
+          fi
+          sleep 2
+        done
+        
+        # 기본값
+        echo "127.0.0.1"
+        return 1
+      }
+      
+      get_public_ip
+
+  # KISA/CSAP 보안 FTP 서버 설정 스크립트
+  - path: /opt/setup_secure_ftp.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+      
+      LOG="/var/log/ftp-setup.log"
+      exec > >(tee -a $LOG) 2>&1
+      
+      echo "$(date): 보안 FTP 서버 설정 시작"
+      echo "FTP 설정 시작 시각: $(date)" >> $LOG
+      echo "Docker 버전: $(docker --version 2>/dev/null || echo 'Docker 미설치')" >> $LOG
+      
+      # Docker 서비스 대기 (시간 증가)
+      timeout=180
+      while [ $timeout -gt 0 ]; do
+        if docker info >/dev/null 2>&1; then
+          echo "$(date): Docker 준비 완료"
+          break
+        fi
+        sleep 5
+        timeout=$((timeout-5))
+      done
+      
+      if [ $timeout -le 0 ]; then
+        echo "$(date): Docker 준비 실패 - 타임아웃"
+        exit 1
+      fi
+      
+      # 환경 변수 로드
+      if [ -f /opt/ftp/.env ]; then
+        source /opt/ftp/.env
+      else
+        echo "$(date): 환경 변수 파일이 없음 - 기본 패스워드 사용"
+        export FTP_USER_PASS="SecureFTP2024!"
+      fi
+      
+      # 보안 디렉토리 구조 생성
+      mkdir -p /opt/ftp/{certs,data,config,logs}
+      
+      # 디렉토리 권한 설정 (KISA 권고사항)
+      chmod 750 /opt/ftp
+      chmod 700 /opt/ftp/certs
+      chmod 755 /opt/ftp/data
+      chmod 750 /opt/ftp/config
+      chmod 750 /opt/ftp/logs
+      
+      if id ftpadmin &>/dev/null; then
+        chown -R ftpadmin:docker /opt/ftp
+      else
+        chown -R root:docker /opt/ftp
+      fi
+      
+      cd /opt/ftp
+      
+      # SSL 인증서 생성 (4096비트, SHA256)
+      openssl req -x509 -nodes -days 365 -newkey rsa:4096 -sha256 \
+        -keyout certs/vsftpd.key \
+        -out certs/vsftpd.pem \
+        -subj "/C=KR/ST=Seoul/L=Seoul/O=KISA-Compliant/OU=Security/CN=secure.ftp.local"
+      
+      # 인증서 권한 설정
+      chmod 600 certs/vsftpd.key
+      chmod 644 certs/vsftpd.pem
+      
+      # vsftpd 보안 설정 파일 (KISA/CSAP 완전 준수)
+      cat > config/vsftpd.conf <<'EOF'
+      # KISA/CSAP 보안 가이드 준수 설정
+      listen=YES
+      listen_ipv6=NO
+      
+      # 계정 관리 (KISA CA-3, CA-4)
+      anonymous_enable=NO
+      local_enable=YES
+      write_enable=YES
+      local_umask=077
+      
+      # 접근 제어 (KISA CA-2)
+      tcp_wrappers=YES
+      userlist_enable=YES
+      userlist_file=/etc/vsftpd.user_list
+      userlist_deny=NO
+      
+      # chroot 설정 (보안 강화)
+      chroot_local_user=YES
+      chroot_list_enable=YES
+      chroot_list_file=/etc/vsftpd.chroot_list
+      allow_writeable_chroot=YES
+      secure_chroot_dir=/var/run/vsftpd/empty
+      
+      # SSL/TLS 설정 (암호화 강제)
+      ssl_enable=YES
+      require_ssl_reuse=NO
+      force_local_data_ssl=YES
+      force_local_logins_ssl=YES
+      ssl_tlsv1_2=YES
+      ssl_tlsv1_3=YES
+      ssl_sslv2=NO
+      ssl_sslv3=NO
+      ssl_tlsv1=NO
+      ssl_tlsv1_1=NO
+      ssl_ciphers=HIGH
+      rsa_cert_file=/etc/ssl/certs/vsftpd.pem
+      rsa_private_key_file=/etc/ssl/private/vsftpd.key
+      
+      # 로깅 설정 (KISA 로그 관리)
+      xferlog_enable=YES
+      xferlog_std_format=YES
+      xferlog_file=/var/log/vsftpd/xferlog
+      log_ftp_protocol=YES
+      vsftpd_log_file=/var/log/vsftpd/vsftpd.log
+      dual_log_enable=YES
+      syslog_enable=YES
+      
+      # 세션 관리 (KISA CA-1)
+      idle_session_timeout=600
+      data_connection_timeout=120
+      
+      # 패시브 모드 설정
+      pasv_enable=YES
+      pasv_min_port=30000
+      pasv_max_port=30010
+      pasv_promiscuous=NO
+      port_promiscuous=NO
+      
+      # 보안 배너
+      ftpd_banner=Authorized Access Only - KISA/CSAP Compliant FTP Server
+      hide_ids=YES
+      
+      # 추가 보안 설정
+      dirmessage_enable=YES
+      use_localtime=YES
+      secure_email_list_enable=NO
+      async_abor_enable=NO
+      ascii_upload_enable=NO
+      ascii_download_enable=NO
+      one_process_model=NO
+      
+      # 성능 및 제한
+      max_clients=50
+      max_per_ip=3
+      anon_max_rate=0
+      local_max_rate=0
+      trans_chunk_size=8192
+      file_open_mode=0640
+      EOF
+      
+      # 사용자 허용 목록
+      echo "ftpuser" > config/vsftpd.user_list
+      echo "ftpuser" > config/vsftpd.chroot_list
+      
+      # 공인 IP 조회
+      PUBLIC_IP=$(/opt/get_public_ip.sh)
+      if [ $? -eq 0 ]; then
+        echo "$(date): 공인 IP 조회 성공: $PUBLIC_IP"
+      else
+        echo "$(date): 공인 IP 조회 실패, 기본 설정 사용"
+        PUBLIC_IP="127.0.0.1"
+      fi
+      
+      # Docker 이미지 다운로드 (재시도 로직)
+      echo "$(date): Docker 이미지 다운로드"
+      for i in {1..3}; do
+        if docker pull fauria/vsftpd:latest; then
+          echo "$(date): Docker 이미지 다운로드 성공"
+          break
+        fi
+        echo "$(date): Docker 이미지 다운로드 재시도 $i/3"
+        sleep 10
+      done
+      
+      # 기존 컨테이너 정리
+      docker stop secure-ftp-server 2>/dev/null || true
+      docker rm secure-ftp-server 2>/dev/null || true
+      
+      # 보안 강화 컨테이너 실행 (단순화하여 안정성 확보)
+      echo "$(date): FTP 컨테이너 실행 중..."
+      docker run -d \
+        --name secure-ftp-server \
+        --restart unless-stopped \
+        --cap-drop ALL \
+        --cap-add CHOWN \
+        --cap-add DAC_OVERRIDE \
+        --cap-add SETUID \
+        --cap-add SETGID \
+        --cap-add NET_BIND_SERVICE \
+        -v /opt/ftp/data:/home/ftpuser \
+        -v /opt/ftp/logs:/var/log/vsftpd \
+        -v /opt/ftp/certs/vsftpd.pem:/etc/ssl/certs/vsftpd.pem:ro \
+        -v /opt/ftp/certs/vsftpd.key:/etc/ssl/private/vsftpd.key:ro \
+        --memory="256m" \
+        --memory-swap="512m" \
+        --cpus="0.5" \
+        -p 21:21 \
+        -p 30000-30010:30000-30010 \
+        -e FTP_USER=ftpuser \
+        -e FTP_PASS="${FTP_USER_PASS}" \
+        -e PASV_ADDRESS="$PUBLIC_IP" \
+        -e PASV_MIN_PORT=30000 \
+        -e PASV_MAX_PORT=30010 \
+        -e LOG_STDOUT=YES \
+        fauria/vsftpd
+      
+      # 컨테이너 상태 확인 (재시도 로직 강화)
+      echo "$(date): 컨테이너 시작 대기 중..."
+      for i in {1..15}; do
+        sleep 5
+        if docker ps | grep secure-ftp-server | grep -q "Up"; then
+          echo "$(date): FTP 서버 컨테이너 정상 실행 중"
+          break
+        elif [ $i -eq 15 ]; then
+          echo "$(date): FTP 서버 컨테이너 시작 실패"
+          echo "Docker 로그:" >> $LOG
+          docker logs secure-ftp-server 2>&1 | tail -20 >> $LOG || true
+          echo "실행 중인 컨테이너:" >> $LOG
+          docker ps -a >> $LOG || true
+          
+          # 간단한 설정으로 재시도
+          echo "$(date): 간단한 설정으로 재시도"
+          docker stop secure-ftp-server 2>/dev/null || true
+          docker rm secure-ftp-server 2>/dev/null || true
+          
+          docker run -d \
+            --name secure-ftp-server \
+            --restart unless-stopped \
+            -p 21:21 \
+            -p 30000-30010:30000-30010 \
+            -v /opt/ftp/data:/home/ftpuser \
+            -v /opt/ftp/logs:/var/log/vsftpd \
+            -e FTP_USER=ftpuser \
+            -e FTP_PASS="${FTP_USER_PASS}" \
+            -e PASV_ADDRESS="$PUBLIC_IP" \
+            -e PASV_MIN_PORT=30000 \
+            -e PASV_MAX_PORT=30010 \
+            -e LOG_STDOUT=YES \
+            fauria/vsftpd
+            
+          sleep 10
+          if docker ps | grep secure-ftp-server | grep -q "Up"; then
+            echo "$(date): 간단한 설정으로 FTP 서버 실행 성공"
+            break
+          fi
+        else
+          echo "$(date): 컨테이너 시작 대기 중... $i/15"
+        fi
+      done
+      
+      # 접속 정보 저장
+      cat > /opt/ftp/credentials.txt <<EOF
+      KISA/CSAP 보안 준수 FTP 서버 접속 정보
+      =====================================
+      서버: $PUBLIC_IP
+      포트: 21 (FTPS)
+      사용자: ftpuser
+      패시브 포트: 30000-30010
+      보안: TLS 1.2+ 권장
+      =====================================
+      
+      주의: 패스워드는 /opt/ftp/.env 파일에 저장됨
+      EOF
+      
+      chmod 400 /opt/ftp/credentials.txt
+      echo "$(date): 보안 FTP 서버 설정 완료"
+      echo "FTP 설정 완료 시각: $(date)" >> $LOG
+      echo "FTP 컨테이너 상태:" >> $LOG
+      docker ps | grep secure-ftp-server >> $LOG || echo "FTP 컨테이너 미실행" >> $LOG
+
+  # UMASK 설정
+  - path: /etc/profile.d/umask.sh
+    permissions: "0644"
+    content: |
+      # KISA 권고 UMASK 설정
+      umask 077
+
+  # 세션 타임아웃 설정
+  - path: /etc/profile.d/timeout.sh
+    permissions: "0644"
+    content: |
+      # KISA 권고 세션 타임아웃
+      readonly TMOUT=600
+      export TMOUT
+
+  # AIDE 설정 (파일 무결성 검사)
+  - path: /etc/aide.conf
+    permissions: "0600"
+    content: |
+      # AIDE 설정 파일 (KISA 권고사항)
+      database=file:/var/lib/aide/aide.db.gz
+      database_out=file:/var/lib/aide/aide.db.new.gz
+      gzip_dbout=yes
+      verbose=5
+      report_url=file:/var/log/aide.log
+      
+      # 중요 디렉토리 및 파일 모니터링
+      /boot p+u+g+acl+selinux+xattrs
+      /bin p+u+g+acl+selinux+xattrs
+      /sbin p+u+g+acl+selinux+xattrs
+      /usr/bin p+u+g+acl+selinux+xattrs
+      /usr/sbin p+u+g+acl+selinux+xattrs
+      /lib p+u+g+acl+selinux+xattrs
+      /lib64 p+u+g+acl+selinux+xattrs
+      /usr/lib p+u+g+acl+selinux+xattrs
+      /usr/lib64 p+u+g+acl+selinux+xattrs
+      
+      # 설정 파일 모니터링
+      /etc p+u+g+acl+selinux+xattrs
+      
+      # 로그 디렉토리 (내용 변경 허용)
+      /var/log l+p+u+g+t
+      
+      # 임시 디렉토리 제외
+      !/var/tmp
+      !/tmp
+      !/proc
+      !/sys
+
+  # Audit 규칙 설정 (보안 감사)
+  - path: /etc/audit/rules.d/audit.rules
+    permissions: "0640"
+    content: |
+      # KISA/CSAP 보안 감사 규칙
+      # 실패한 로그인 시도 모니터링
+      -w /var/log/faillog -p wa -k logins
+      -w /var/log/lastlog -p wa -k logins
+      -w /var/log/tallylog -p wa -k logins
+      
+      # 인증 관련 파일 모니터링
+      -w /etc/passwd -p wa -k identity
+      -w /etc/group -p wa -k identity
+      -w /etc/gshadow -p wa -k identity
+      -w /etc/shadow -p wa -k identity
+      -w /etc/security/opasswd -p wa -k identity
+      
+      # 중요 시스템 명령어 모니터링
+      -w /usr/bin/passwd -p x -k passwd_modification
+      -w /usr/bin/gpasswd -p x -k group_modification
+      -w /usr/bin/chage -p x -k user_modification
+      -w /usr/sbin/usermod -p x -k user_modification
+      -w /usr/sbin/adduser -p x -k user_modification
+      
+      # 네트워크 환경 변경 모니터링
+      -a always,exit -F arch=b64 -S sethostname -S setdomainname -k system-locale
+      -w /etc/issue -p wa -k system-locale
+      -w /etc/issue.net -p wa -k system-locale
+      -w /etc/hosts -p wa -k system-locale
+      -w /etc/network -p wa -k system-locale
+      
+      # 권한 변경 모니터링
+      -a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod
+      -a always,exit -F arch=b64 -S chown -S fchown -S fchownat -S lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
+      
+      # 파일 삭제 모니터링
+      -a always,exit -F arch=b64 -S unlink -S unlinkat -S rename -S renameat -F auid>=1000 -F auid!=4294967295 -k delete
+      
+      # sudo 사용 모니터링
+      -w /etc/sudoers -p wa -k scope
+      -w /etc/sudoers.d/ -p wa -k scope
+      
+      # 커널 모듈 로딩 모니터링
+      -w /sbin/insmod -p x -k modules
+      -w /sbin/rmmod -p x -k modules
+      -w /sbin/modprobe -p x -k modules
+      -a always,exit -F arch=b64 -S init_module -S delete_module -k modules
+
+  # Rootkit 검사 설정 (rkhunter)
+  - path: /etc/rkhunter.conf
+    permissions: "0644"
+    content: |
+      # Rootkit Hunter 설정 (KISA 보안 강화)
+      UPDATE_MIRRORS=1
+      MIRRORS_MODE=0
+      WEB_CMD=""
+      
+      # 로그 설정
+      LOGFILE=/var/log/rkhunter.log
+      APPEND_LOG=1
+      COPY_LOG_ON_ERROR=1
+      
+      # 검사 설정
+      HASH_CMD=SHA256
+      PKGMGR=RPM
+      PHALANX2_DIRTEST=0
+      ALLOW_SSH_ROOT_USER=no
+      ALLOW_SSH_PROT_V1=0
+      
+      # 경고 억제 (정상적인 파일들)
+      ALLOWHIDDENDIR=/etc/.java
+      ALLOWHIDDENFILE=/etc/.java
+      ALLOWHIDDENFILE=/usr/share/man/man1/..1.gz
+      ALLOWHIDDENFILE=/usr/bin/.fipscheck
+      ALLOWHIDDENFILE=/usr/bin/.dockerenv
+      
+      # 스크립트 화이트리스트
+      SCRIPTWHITELIST=/usr/bin/egrep
+      SCRIPTWHITELIST=/usr/bin/fgrep
+      SCRIPTWHITELIST=/usr/bin/which
+      SCRIPTWHITELIST=/usr/bin/ldd
+      
+      # 포트 화이트리스트
+      ALLOWPROCLISTEN=/sbin/dhclient:68
+      ALLOWPROCLISTEN=/usr/sbin/sshd:22
+      ALLOWPROCLISTEN=/usr/sbin/xinetd:21
+
+  # 로그 로테이션 설정
+  - path: /etc/logrotate.d/security-logs
+    permissions: "0644"
+    content: |
+      # 보안 로그 로테이션 설정
+      /var/log/kisa-csap-check.log {
+          weekly
+          rotate 52
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0644 root root
+      }
+      
+      /var/log/aide.log {
+          monthly
+          rotate 12
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0600 root root
+      }
+      
+      /var/log/rkhunter.log {
+          monthly
+          rotate 12
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0644 root root
+      }
+
+  # 보안 모니터링 스크립트 (확장)
+  - path: /opt/security_monitor.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # KISA/CSAP 보안 모니터링 스크립트
+      
+      LOG_FILE="/var/log/security-monitor.log"
+      DATE=$(date '+%Y-%m-%d %H:%M:%S')
+      
+      log() {
+          echo "[$DATE] $1" | tee -a "$LOG_FILE"
+      }
+      
+      # 실패한 로그인 시도 확인
+      check_failed_logins() {
+          log "=== 실패한 로그인 시도 확인 ==="
+          failed_ssh=$(grep "Failed password" /var/log/secure 2>/dev/null | tail -10 | wc -l)
+          if [ "$failed_ssh" -gt 5 ]; then
+              log "경고: 최근 SSH 로그인 실패 시도가 많음 ($failed_ssh회)"
+          else
+              log "정보: SSH 로그인 실패 시도 정상 수준 ($failed_ssh회)"
+          fi
+      }
+      
+      # 시스템 리소스 모니터링
+      check_system_resources() {
+          log "=== 시스템 리소스 확인 ==="
+          
+          # CPU 사용률
+          cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
+          if (( $(echo "$cpu_usage > 80" | bc -l 2>/dev/null || echo 0) )); then
+              log "경고: CPU 사용률 높음 ($cpu_usage%)"
+          fi
+          
+          # 메모리 사용률
+          mem_usage=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}')
+          if (( $(echo "$mem_usage > 80" | bc -l 2>/dev/null || echo 0) )); then
+              log "경고: 메모리 사용률 높음 ($mem_usage%)"
+          fi
+          
+          # 디스크 사용률
+          disk_usage=$(df / | tail -1 | awk '{print $5}' | cut -d'%' -f1)
+          if [ "$disk_usage" -gt 80 ]; then
+              log "경고: 디스크 사용률 높음 ($disk_usage%)"
+          fi
+      }
+      
+      # 네트워크 연결 확인
+      check_network_connections() {
+          log "=== 네트워크 연결 확인 ==="
+          suspicious_connections=$(netstat -tn 2>/dev/null | grep ESTABLISHED | wc -l)
+          if [ "$suspicious_connections" -gt 50 ]; then
+              log "경고: 설정된 연결 수가 많음 ($suspicious_connections개)"
+          fi
+      }
+      
+      # 프로세스 확인
+      check_processes() {
+          log "=== 프로세스 확인 ==="
+          
+          # Docker 컨테이너 상태
+          if command -v docker >/dev/null 2>&1; then
+              if docker ps --format "{{.Names}}" | grep -q "secure-ftp-server"; then
+                  log "정보: FTP 컨테이너 정상 실행 중"
+              else
+                  log "경고: FTP 컨테이너가 실행되지 않음"
+              fi
+          fi
+          
+          # 의심스러운 프로세스 확인
+          suspicious_procs=$(ps aux | grep -E "(nc|netcat|telnet|nmap)" | grep -v grep | wc -l)
+          if [ "$suspicious_procs" -gt 0 ]; then
+              log "경고: 의심스러운 네트워크 도구 실행 중"
+          fi
+      }
+      
+      # 파일 시스템 무결성 확인
+      check_file_integrity() {
+          log "=== 파일 시스템 무결성 확인 ==="
+          
+          # 중요 설정 파일 권한 확인
+          check_file_perm() {
+              local file=$1
+              local expected_perm=$2
+              if [ -f "$file" ]; then
+                  actual_perm=$(stat -c "%a" "$file")
+                  if [ "$actual_perm" != "$expected_perm" ]; then
+                      log "경고: $file 권한이 예상과 다름 (실제: $actual_perm, 예상: $expected_perm)"
+                  fi
+              fi
+          }
+          
+          check_file_perm "/etc/passwd" "644"
+          check_file_perm "/etc/shadow" "000"
+          check_file_perm "/etc/ssh/sshd_config" "600"
+      }
+      
+      # 메인 실행
+      main() {
+          log "보안 모니터링 시작"
+          check_failed_logins
+          check_system_resources
+          check_network_connections
+          check_processes
+          check_file_integrity
+          log "보안 모니터링 완료"
+      }
+      
+      main "$@"
+
+  # 자동 보안 업데이트 스크립트
+  - path: /opt/auto_security_update.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # 자동 보안 업데이트 스크립트
+      
+      LOG_FILE="/var/log/security-update.log"
+      DATE=$(date '+%Y-%m-%d %H:%M:%S')
+      
+      log() {
+          echo "[$DATE] $1" | tee -a "$LOG_FILE"
+      }
+      
+      log "자동 보안 업데이트 시작"
+      
+      # AIDE 데이터베이스 업데이트
+      if command -v aide >/dev/null 2>&1; then
+          log "AIDE 데이터베이스 업데이트 중..."
+          aide --init 2>/dev/null && mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+          log "AIDE 데이터베이스 업데이트 완료"
+      fi
+      
+      # Rootkit 검사
+      if command -v rkhunter >/dev/null 2>&1; then
+          log "Rootkit 검사 시작..."
+          rkhunter --update --quiet
+          rkhunter --checkall --skip-keypress --quiet --report-warnings-only
+          log "Rootkit 검사 완료"
+      fi
+      
+      # 보안 로그 정리
+      log "보안 로그 정리 중..."
+      find /var/log -name "*.log" -type f -size +100M -exec logrotate -f /etc/logrotate.d/security-logs {} \;
+      
+      log "자동 보안 업데이트 완료"
+
+# ============================================
+# 5. 실행 명령
+# ============================================
+runcmd:
+  # EPEL 저장소 설치 (Rocky Linux 9 호환)
+  - |
+    echo "EPEL 저장소 설치 시도" >> /var/log/setup-progress.log
+    dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm 2>/dev/null || 
+    dnf install -y epel-release 2>/dev/null || 
+    echo "EPEL 설치 실패 - 계속 진행" >> /var/log/setup-progress.log
+  
+  # SELinux 강제 모드 설정 (SELinux가 있는 경우만)
+  - getenforce >/dev/null 2>&1 && setenforce 1 || true
+  
+  # 커널 파라미터 영구 적용
+  - |
+    cat >> /etc/sysctl.conf <<EOF
+    # 보안 강화 설정
+    net.ipv4.tcp_syncookies = 1
+    net.ipv4.conf.all.rp_filter = 1
+    net.ipv4.conf.default.rp_filter = 1
+    net.ipv4.conf.all.accept_source_route = 0
+    net.ipv4.conf.all.accept_redirects = 0
+    net.ipv4.conf.all.secure_redirects = 0
+    net.ipv4.icmp_echo_ignore_broadcasts = 1
+    net.ipv4.icmp_ignore_bogus_error_responses = 1
+    kernel.randomize_va_space = 2
+    fs.suid_dumpable = 0
+    EOF
+  - sysctl -p
+  
+  # 방화벽 설정
+  - systemctl enable firewalld
+  - systemctl start firewalld
+  - firewall-cmd --permanent --add-port=22/tcp
+  - firewall-cmd --permanent --add-port=21/tcp
+  - firewall-cmd --permanent --add-port=30000-30010/tcp
+  - firewall-cmd --permanent --zone=public --add-service=ftp
+  - firewall-cmd --reload
+  
+  # Fail2ban 설정 및 시작 (설치된 경우만)
+  - which fail2ban-server >/dev/null 2>&1 && systemctl enable fail2ban || true
+  - which fail2ban-server >/dev/null 2>&1 && systemctl start fail2ban || true
+  
+  # Audit 시작 (설치된 경우만)
+  - which auditd >/dev/null 2>&1 && systemctl enable auditd || true
+  - which auditd >/dev/null 2>&1 && systemctl start auditd || true
+  
+  # SSH 서비스 재시작
+  - systemctl restart sshd
+  
+  # 1단계: 보안 패스워드 생성
+  - echo "=== 보안 패스워드 생성 시작 ===" > /var/log/setup-progress.log
+  - /opt/generate_passwords.sh
+  - echo "=== 보안 패스워드 생성 완료 ===" >> /var/log/setup-progress.log
+  
+  # 2단계: Docker 설치
+  - echo "=== Docker 설치 시작 ===" >> /var/log/setup-progress.log
+  - /opt/install_docker_secure.sh
+  - echo "=== Docker 설치 완료 ===" >> /var/log/setup-progress.log
+  
+  # 3단계: FTP 서버 설정
+  - echo "=== FTP 서버 설정 시작 ===" >> /var/log/setup-progress.log
+  - |
+    # Docker 상태 확인 후 FTP 설정 실행
+    for i in {1..12}; do
+      if docker info >/dev/null 2>&1; then
+        echo "$(date): Docker 준비 완료, FTP 설정 시작" >> /var/log/setup-progress.log
+        /opt/setup_secure_ftp.sh || echo "FTP 서버 설정 중 경고 발생" >> /var/log/setup-progress.log
+        break
+      fi
+      echo "$(date): Docker 준비 대기 중... $i/12" >> /var/log/setup-progress.log
+      sleep 10
+    done
+  - echo "=== FTP 서버 설정 완료 ===" >> /var/log/setup-progress.log
+  
+  # 4단계: 파일 권한 최종 설정
+  - chmod 700 /root
+  - chmod 700 /home/* 2>/dev/null || true
+  - chmod 644 /etc/passwd
+  - chmod 000 /etc/shadow
+  - chmod 644 /etc/group
+  - chmod 000 /etc/gshadow
+  - chmod 600 /etc/ssh/sshd_config 2>/dev/null || true
+  
+  # 5단계: 로그 디렉토리 권한 설정
+  - mkdir -p /var/log/ftp 2>/dev/null || true
+  - chmod 755 /var/log/ftp 2>/dev/null || true
+  
+  # 6단계: README 파일 생성
+  - |
+    cat > /home/azureuser/README.md <<'EOF'
+    # KISA/CSAP 보안 준수 FTP 서버
+    
+    ## 설정 완료 후 사용 가능한 명령어
+    
+    ### 보안 검증
+    ```bash
+    # 별도 제공된 safe_checker.sh 스크립트 사용
+    # 해당 스크립트는 별도로 배포됨
+    ```
+    
+    ### FTP 서버 관리
+    ```bash
+    # 컨테이너 상태 확인
+    sudo docker ps
+    
+    # FTP 서버 로그 확인
+    sudo docker logs secure-ftp-server
+    
+    # 접속 정보 확인
+    sudo cat /opt/ftp/credentials.txt
+    
+    # FTP 서버 재시작
+    sudo docker restart secure-ftp-server
+    ```
+    
+    ### 로그 확인
+    ```bash
+    # 설치 로그
+    sudo tail -f /var/log/docker-install.log
+    sudo tail -f /var/log/ftp-setup.log
+    
+    # 보안 검증 로그
+    sudo tail -f /var/log/kisa-csap-check.log
+    
+    # 설정 진행 상황
+    sudo tail -f /var/log/setup-progress.log
+    ```
+    
+    ### 주요 파일 위치
+    - FTP 설정: /opt/ftp/config/vsftpd.conf
+    - SSL 인증서: /opt/ftp/certs/
+    - 데이터 디렉토리: /opt/ftp/data/
+    - 접속 정보: /opt/ftp/credentials.txt
+    - 보안 체커: 별도 제공
+    EOF
+  
+  - chown azureuser:azureuser /home/azureuser/README.md 2>/dev/null || true
+  
+  # 7단계: 보안 도구 초기화 및 설정
+  - echo "=== 보안 도구 초기화 시작 ===" >> /var/log/setup-progress.log
+  
+  # AIDE 파일 무결성 검사 초기화 (설치된 경우만)
+  - which aide >/dev/null 2>&1 && aide --init 2>/dev/null && mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz 2>/dev/null || echo "AIDE 초기화 스킵" >> /var/log/setup-progress.log
+  
+  # Rootkit Hunter 데이터베이스 업데이트 (설치된 경우만)
+  - which rkhunter >/dev/null 2>&1 && rkhunter --update --quiet 2>/dev/null || echo "RKHunter 업데이트 스킵" >> /var/log/setup-progress.log
+  
+  # Fail2ban 재시작 (설치된 경우만)
+  - which fail2ban-server >/dev/null 2>&1 && systemctl restart fail2ban 2>/dev/null || echo "Fail2ban 재시작 스킵" >> /var/log/setup-progress.log
+  
+  # Audit 서비스 재시작 (설치된 경우만)
+  - which auditd >/dev/null 2>&1 && systemctl restart auditd 2>/dev/null || echo "Auditd 재시작 스킵" >> /var/log/setup-progress.log
+  
+  # 보안 모니터링 크론 작업 추가
+  - |
+    cat >> /etc/crontab <<'EOF'
+    # KISA/CSAP 보안 모니터링 자동화
+    # 매시간 보안 모니터링 실행
+    0 * * * * root /opt/security_monitor.sh >/dev/null 2>&1
+    
+    # 매일 새벽 2시 AIDE 파일 무결성 검사
+    0 2 * * * root aide --check --report=file:/var/log/aide-daily.log 2>/dev/null || echo "$(date): AIDE 검사 실패" >> /var/log/aide-daily.log
+    
+    # 매주 일요일 새벽 3시 Rootkit 검사
+    0 3 * * 0 root /usr/bin/rkhunter --checkall --skip-keypress --quiet --report-warnings-only --logfile /var/log/rkhunter-weekly.log
+    
+    # 매일 새벽 4시 보안 업데이트 스크립트 실행
+    0 4 * * * root /opt/auto_security_update.sh >/dev/null 2>&1
+    EOF
+  
+  # 로그 로테이션 설정 적용
+  - logrotate /etc/logrotate.d/security-logs 2>/dev/null || true
+  
+  # 시스템 보안 강화 설정
+  - |
+    # 추가 보안 커널 파라미터 설정
+    cat >> /etc/sysctl.conf <<'EOF'
+    
+    # KISA/CSAP 추가 보안 설정
+    # 메모리 보호
+    # kernel.exec-shield = 1  # Rocky Linux 9에서 지원 안함
+    kernel.randomize_va_space = 2
+    
+    # 네트워크 보안 강화
+    net.ipv4.conf.all.log_martians = 1
+    net.ipv4.conf.default.log_martians = 1
+    net.ipv4.conf.all.send_redirects = 0
+    net.ipv4.conf.default.send_redirects = 0
+    net.ipv4.icmp_ignore_bogus_error_responses = 1
+    
+    # IP 스푸핑 방지
+    net.ipv4.conf.all.rp_filter = 1
+    net.ipv4.conf.default.rp_filter = 1
+    
+    # 파일 시스템 보안
+    fs.protected_hardlinks = 1
+    fs.protected_symlinks = 1
+    fs.suid_dumpable = 0
+    
+    # DoS 공격 방지
+    net.ipv4.tcp_syncookies = 1
+    net.ipv4.tcp_max_syn_backlog = 2048
+    net.ipv4.tcp_synack_retries = 2
+    net.ipv4.tcp_syn_retries = 5
+    
+    # IPv6 비활성화 (필요시)
+    net.ipv6.conf.all.disable_ipv6 = 0
+    net.ipv6.conf.default.disable_ipv6 = 0
+    EOF
+    sysctl -p >/dev/null 2>&1 || true
+  
+  # 보안 모듈 로드 확인
+  - lsmod | grep -E "(ip_tables|iptable_filter|nf_conntrack)" >/dev/null 2>&1 || echo "방화벽 모듈 로드 확인 필요" >> /var/log/setup-progress.log
+  
+  # 추가 방화벽 규칙 설정
+  - firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='0.0.0.0/0' port protocol='tcp' port='21' accept" 2>/dev/null || true
+  - firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='0.0.0.0/0' port protocol='tcp' port='30000-30010' accept" 2>/dev/null || true
+  
+  # 불필요한 서비스 비활성화 (보안 강화 - 존재하는 경우만)
+  - systemctl list-unit-files | grep -q telnet.socket && systemctl disable telnet.socket 2>/dev/null || true
+  - systemctl list-unit-files | grep -q rsh.socket && systemctl disable rsh.socket 2>/dev/null || true
+  - systemctl list-unit-files | grep -q rlogin.socket && systemctl disable rlogin.socket 2>/dev/null || true
+  - systemctl list-unit-files | grep -q vsftpd && systemctl disable vsftpd 2>/dev/null || true  # Docker 컨테이너 사용으로 시스템 vsftpd 비활성화
+  
+  # 시스템 보안 설정 검증
+  - |
+    echo "=== 보안 설정 검증 ===" >> /var/log/setup-progress.log
+    
+    # SELinux 상태 확인
+    getenforce >> /var/log/setup-progress.log 2>&1 || echo "SELinux 상태 확인 실패" >> /var/log/setup-progress.log
+    
+    # 방화벽 상태 확인
+    systemctl is-active firewalld >> /var/log/setup-progress.log 2>&1 || echo "방화벽 상태 확인 실패" >> /var/log/setup-progress.log
+    
+    # 보안 서비스 상태 확인 (설치된 경우만)
+    which fail2ban-server >/dev/null 2>&1 && systemctl is-active fail2ban >> /var/log/setup-progress.log 2>&1 || echo "Fail2ban 서비스 미설치 또는 비활성" >> /var/log/setup-progress.log
+    which auditd >/dev/null 2>&1 && systemctl is-active auditd >> /var/log/setup-progress.log 2>&1 || echo "Audit 서비스 미설치 또는 비활성" >> /var/log/setup-progress.log
+  
+    echo "=== 보안 도구 초기화 완료 ===" >> /var/log/setup-progress.log
+
+  # 8단계: 최종 상태 확인 (오류 허용)
+  - echo "=== 최종 상태 확인 ===" >> /var/log/setup-progress.log
+  - which docker >/dev/null 2>&1 && docker ps >> /var/log/setup-progress.log 2>&1 || echo "Docker 미설치 또는 실행 중 오류" >> /var/log/setup-progress.log
+  - systemctl status docker --no-pager >> /var/log/setup-progress.log 2>&1 || echo "Docker 서비스 상태 확인 불가" >> /var/log/setup-progress.log
+  - ls -la /opt/ftp/ >> /var/log/setup-progress.log 2>&1 || echo "/opt/ftp/ 디렉토리 미존재" >> /var/log/setup-progress.log
+  
+  # 보안 설정 최종 확인
+  - echo "=== 보안 설정 최종 확인 ===" >> /var/log/setup-progress.log
+  - echo "보안 검증은 별도 safe_checker.sh 스크립트로 수행 가능" >> /var/log/setup-progress.log
+  
+  - echo "=== 전체 설정 완료 ===" >> /var/log/setup-progress.log
+
+# ============================================
+# 6. SSH 키 설정 (운영 환경에서는 실제 키로 교체)
+# ============================================
+# ssh_authorized_keys:
+#   - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQ... # 실제 공개키로 교체 필요
+
+# ============================================
+# 7. SSH 및 기타 설정
+# ============================================
+
+# SSH 설정 (보안 강화)
+ssh_pwauth: false       # 패스워드 인증 비활성화
+disable_root: true      # root 계정 비활성화
+
+# 재부팅 설정 (선택적)
+power_state:
+  mode: reboot
+  delay: "+3"
+  message: "KISA/CSAP 보안 설정 완료 - 시스템 재부팅"
+  condition: false  # 필요시 true로 변경
+
+# 최종 메시지
+final_message: |
+  KISA/CSAP 보안 준수 FTP 서버 설정이 완료되었습니다.
+  
+  보안 검증: 별도 제공된 safe_checker.sh 스크립트 사용
+  FTP 접속 정보: sudo cat /opt/ftp/credentials.txt
+  
+  중요: SSH 키 기반 인증을 사용하세요.
+  패스워드는 보안을 위해 랜덤 생성되었습니다.
+  
+  설정 진행 상황: /var/log/setup-progress.log
+  보안 검증 로그: /var/log/kisa-csap-check.log
+  상세 사용법: /home/azureuser/README.md

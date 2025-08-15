@@ -41,7 +41,8 @@ resource "azurerm_linux_virtual_machine" "vm" {
     name      = "9-lvm"
   }
 
-  custom_data = base64encode(file("${path.module}/ftp_cloud_config.yml"))
+  # custom_data 제거 - 파일 크기가 87,380자 제한 초과
+  # 대신 VM 생성 후 별도 스크립트로 설정 적용
 
   # Managed Identity 추가 (중요!)
   identity {

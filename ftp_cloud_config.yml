@@ -153,7 +153,6 @@ write_files:
   # KISA/CSAP 보안 체크리스트 검증 스크립트
   - path: /home/azureuser/safe_checker.sh
     permissions: "0755"
-    owner: azureuser:azureuser
     content: |
       #!/bin/bash
 
@@ -844,43 +843,44 @@ runcmd:
   - firewall-cmd --permanent --add-port=30000-30010/tcp
   - firewall-cmd --reload
 
-  # Docker 설치 (백그라운드)
-  - nohup /opt/install_docker.sh > /var/log/docker-install-bg.log 2>&1 &
+  # 1단계: Docker 설치 (순차 실행으로 변경)
+  - echo "=== Docker 설치 시작 ===" > /var/log/setup-progress.log
+  - /opt/install_docker.sh
+  - echo "=== Docker 설치 완료 ===" >> /var/log/setup-progress.log
 
-  # FTP 서버 설정 (Docker 설치 후 - 대기 시간 증가)
-  - nohup bash -c 'sleep 120 && /opt/setup_ftp.sh' > /var/log/ftp-setup-bg.log 2>&1 &
+  # 2단계: FTP 서버 설정 (Docker 설치 완료 후 바로 실행)
+  - echo "=== FTP 서버 설정 시작 ===" >> /var/log/setup-progress.log
+  - /opt/setup_ftp.sh
+  - echo "=== FTP 서버 설정 완료 ===" >> /var/log/setup-progress.log
 
-  # 상태 확인 스크립트
-  - nohup bash -c 'sleep 180 && echo "=== 최종 상태 ===" > /var/log/final-status.log && docker ps >> /var/log/final-status.log && systemctl status docker >> /var/log/final-status.log && cat /opt/ftp/credentials.txt >> /var/log/final-status.log' &
+  # 3단계: 파일 소유권 변경 (사용자 생성 완료 후)
+  - chown azureuser:azureuser /home/azureuser/safe_checker.sh 2>/dev/null || echo "safe_checker.sh 소유권 변경 실패" >> /var/log/setup-progress.log
+  - chmod +x /home/azureuser/safe_checker.sh 2>/dev/null || echo "safe_checker.sh 권한 변경 실패" >> /var/log/setup-progress.log
 
-  # 보안 체커 스크립트 권한 설정 및 사용자 편의성 향상
-  - chown azureuser:azureuser /home/azureuser/safe_checker.sh
-  - chmod +x /home/azureuser/safe_checker.sh
+  # 4단계: 편의를 위한 별칭과 심볼릭 링크 생성
+  - ln -sf /home/azureuser/safe_checker.sh /usr/local/bin/security-check 2>/dev/null || true
+  - echo 'alias security-check="sudo /home/azureuser/safe_checker.sh"' >> /home/azureuser/.bashrc 2>/dev/null || true
+  - echo 'alias sc="sudo /home/azureuser/safe_checker.sh"' >> /home/azureuser/.bashrc 2>/dev/null || true
 
-  # 편의를 위한 별칭과 심볼릭 링크 생성
-  - ln -sf /home/azureuser/safe_checker.sh /usr/local/bin/security-check
-  - echo 'alias security-check="sudo /home/azureuser/safe_checker.sh"' >> /home/azureuser/.bashrc
-  - echo 'alias sc="sudo /home/azureuser/safe_checker.sh"' >> /home/azureuser/.bashrc
-
-  # README 파일 생성
+  # 5단계: README 파일 생성
   - |
-    cat > /home/azureuser/README.md <<EOF
+    cat > /home/azureuser/README.md <<'EOF'
     # KISA/CSAP 보안 준수 FTP 서버
 
     ## 설정 완료 후 사용 가능한 명령어
 
     ### 보안 검증
-    \`\`\`bash
+    ```bash
     # 전체 보안 체크리스트 검증
     sudo ./safe_checker.sh
 
     # 또는 별칭 사용
     security-check
     sc
-    \`\`\`
+    ```
 
     ### FTP 서버 관리
-    \`\`\`bash
+    ```bash
     # 컨테이너 상태 확인
     sudo docker ps
 
@@ -892,17 +892,20 @@ runcmd:
 
     # FTP 서버 재시작
     sudo docker restart secure-ftp-server
-    \`\`\`
+    ```
 
     ### 로그 확인
-    \`\`\`bash
+    ```bash
     # 설치 로그
     sudo tail -f /var/log/docker-install.log
     sudo tail -f /var/log/ftp-setup.log
 
     # 보안 검증 로그
     sudo tail -f /var/log/kisa-csap-check.log
-    \`\`\`
+
+    # 설정 진행 상황
+    sudo tail -f /var/log/setup-progress.log
+    ```
 
     ### 주요 파일 위치
     - FTP 설정: /opt/ftp/config/vsftpd.conf
@@ -910,11 +913,16 @@ runcmd:
     - 데이터 디렉토리: /opt/ftp/data/
     - 접속 정보: /opt/ftp/credentials.txt
     - 보안 체커: ~/safe_checker.sh
-
-    생성일: $(date)
     EOF
 
-  - chown azureuser:azureuser /home/azureuser/README.md
+  - chown azureuser:azureuser /home/azureuser/README.md 2>/dev/null || true
+
+  # 6단계: 최종 상태 확인
+  - echo "=== 최종 상태 확인 ===" >> /var/log/setup-progress.log
+  - docker ps >> /var/log/setup-progress.log 2>&1 || echo "Docker 컨테이너 상태 확인 실패" >> /var/log/setup-progress.log
+  - systemctl status docker --no-pager >> /var/log/setup-progress.log 2>&1 || true
+  - ls -la /opt/ftp/ >> /var/log/setup-progress.log 2>&1 || echo "/opt/ftp/ 디렉토리 확인 실패" >> /var/log/setup-progress.log
+  - echo "=== 설정 완료 ===" >> /var/log/setup-progress.log
 
 # SSH 설정
 ssh_pwauth: true
@@ -928,4 +936,4 @@ chpasswd:
   expire: false
 
 # 최종 메시지
-final_message: "KISA/CSAP 보안 준수 FTP 서버 설정 완료! 설정 상황: /var/log/docker-install.log, /var/log/ftp-setup.log 확인. 완료 후 'sudo ./safe_checker.sh' 또는 'security-check'로 보안 검증 실행 가능. 접속 정보는 /opt/ftp/credentials.txt에서 확인. 상세 사용법은 ~/README.md 참조."
+final_message: "KISA/CSAP 보안 준수 FTP 서버 설정 완료! 설정 진행 상황: /var/log/setup-progress.log 확인. 완료 후 'sudo ./safe_checker.sh' 또는 'security-check'로 보안 검증 실행 가능. 접속 정보는 /opt/ftp/credentials.txt에서 확인. 상세 사용법은 ~/README.md 참조."

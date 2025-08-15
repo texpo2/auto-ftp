@@ -1,10 +1,10 @@
-/*
+
 resource "azurerm_bastion_host" "bastion" {
   name                = "team2-bastion"
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   sku                 = "Standard"
-  
+
   # Bastion 고급 기능 활성화
   copy_paste_enabled     = true
   file_copy_enabled      = true
@@ -23,4 +23,3 @@ resource "azurerm_bastion_host" "bastion" {
     azurerm_public_ip.bastion_pip
   ]
 }
-*/
