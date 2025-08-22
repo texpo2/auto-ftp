@@ -1,0 +1,283 @@
+#cloud-config
+# KISA/CSAP Security Guideline Compliant FTP Server Setup - Phase 1 (Base Setup)
+# Date: 2025/01/17
+# Version: 5.0 (Split Execution Version)
+
+# ============================================
+# 1. Boot Commands - DNS and Initial Security Setup
+# ============================================
+bootcmd:
+  # DNS Configuration
+  - echo "nameserver 168.63.129.16" > /etc/resolv.conf
+  - echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+  - echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+  - echo "options timeout:2 attempts:3" >> /etc/resolv.conf
+  
+  # Security Kernel Parameters
+  - sysctl -w net.ipv4.tcp_syncookies=1
+  - sysctl -w net.ipv4.conf.all.rp_filter=1
+  - sysctl -w net.ipv4.conf.default.rp_filter=1
+  - sysctl -w net.ipv4.conf.all.accept_source_route=0
+  - sysctl -w net.ipv4.icmp_echo_ignore_broadcasts=1
+  - sysctl -w net.ipv4.icmp_ignore_bogus_error_responses=1
+
+# ============================================
+# 2. Package Management
+# ============================================
+package_update: true
+package_upgrade: false
+package_reboot_if_required: false
+
+# Install essential packages only (minimized)
+packages:
+  - firewalld
+  - curl
+  - wget
+  - git
+  - openssl
+  - dnf-plugins-core
+
+# ============================================
+# 3. User and Group Configuration
+# ============================================
+users:
+  - name: ftpadmin
+    groups: docker
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:/usr/bin/docker', 'ALL=(ALL) NOPASSWD:/usr/bin/systemctl']
+    lock_passwd: false
+  - name: azureuser
+    groups: users
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) ALL']
+    lock_passwd: false
+
+# ============================================
+# 4. Create Essential Files Only
+# ============================================
+write_files:
+  # Lock DNS Configuration
+  - path: /etc/NetworkManager/conf.d/dns.conf
+    content: |
+      [main]
+      dns=none
+
+  - path: /etc/systemd/resolved.conf
+    content: |
+      [Resolve]
+      DNS=168.63.129.16 8.8.8.8 8.8.4.4
+      FallbackDNS=1.1.1.1
+      DNSStubListener=no
+
+  # SSH Security Configuration (Password Authentication Enabled)
+  - path: /etc/ssh/sshd_config.d/99-security.conf
+    permissions: "0600"
+    content: |
+      # KISA Recommendations Compliance
+      PermitRootLogin no
+      PasswordAuthentication yes
+      PubkeyAuthentication yes
+      PermitEmptyPasswords no
+      MaxAuthTries 3
+      MaxSessions 2
+      ClientAliveInterval 300
+      ClientAliveCountMax 0
+      LoginGraceTime 60
+      X11Forwarding no
+      AllowUsers azureuser ftpadmin
+      LogLevel VERBOSE
+
+  # Phase 2 Ready Flag
+  - path: /opt/phase2_ready
+    content: |
+      # Phase 2 Ready Flag
+
+  # Phase 2 Main Script
+  - path: /opt/setup_phase2.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+      
+      # Phase 2 Execution Log
+      LOG="/var/log/phase2-setup.log"
+      exec > >(tee -a $LOG) 2>&1
+      
+      echo "========================================="
+      echo "Phase 2 Setup Starting: $(date)"
+      echo "========================================="
+      
+      # Check if already executed
+      if [ -f /opt/phase2_complete ]; then
+          echo "Phase 2 already completed."
+          exit 0
+      fi
+      
+      # Wait for network
+      echo "Checking network connection..."
+      for i in {1..30}; do
+          if ping -c 1 8.8.8.8 &>/dev/null; then
+              echo "Network connection confirmed"
+              break
+          fi
+          echo "Waiting for network... $i/30"
+          sleep 5
+      done
+      
+      # Phase 2 full script download or execution
+      echo "Executing Phase 2 full script..."
+      
+      # Check if Phase 2 script already exists
+      if [ -f /opt/phase2_complete_setup.sh ]; then
+          echo "Running Phase 2 full script..."
+          chmod +x /opt/phase2_complete_setup.sh
+          /opt/phase2_complete_setup.sh
+      else
+          echo "Phase 2 script needs to be copied to /opt/phase2_complete_setup.sh"
+          echo "Example: scp phase2_complete_setup.sh azureuser@VM_IP:/tmp/"
+          echo "         sudo mv /tmp/phase2_complete_setup.sh /opt/"
+          echo "         sudo chmod +x /opt/phase2_complete_setup.sh"
+          echo "         sudo /opt/phase2_complete_setup.sh"
+      fi
+      
+      # Completion flag
+      if [ -f /opt/phase2_complete ]; then
+          echo "========================================="
+          echo "Phase 2 Setup Completed: $(date)"
+          echo "========================================="
+      else
+          echo "Phase 2 setup not yet completed."
+          echo "Please run phase2_complete_setup.sh manually."
+      fi
+
+# ============================================
+# 5. Run Commands (Minimized)
+# ============================================
+runcmd:
+  # Basic security setup
+  - sh -c 'echo "Phase 1 Starting - $(date)" > /var/log/cloud-init-phase1.log'
+  
+  # SELinux Configuration
+  - getenforce >/dev/null 2>&1 && setenforce 1 || true
+  
+  # Apply kernel parameters permanently
+  - |
+    cat >> /etc/sysctl.conf <<EOF
+    # KISA/CSAP Security Hardening
+    net.ipv4.tcp_syncookies = 1
+    net.ipv4.conf.all.rp_filter = 1
+    net.ipv4.conf.default.rp_filter = 1
+    net.ipv4.conf.all.accept_source_route = 0
+    net.ipv4.conf.all.accept_redirects = 0
+    net.ipv4.conf.all.secure_redirects = 0
+    net.ipv4.icmp_echo_ignore_broadcasts = 1
+    net.ipv4.icmp_ignore_bogus_error_responses = 1
+    kernel.randomize_va_space = 2
+    fs.suid_dumpable = 0
+    EOF
+  - sysctl -p
+  
+  # Firewall basic configuration
+  - systemctl enable firewalld
+  - systemctl start firewalld
+  - firewall-cmd --permanent --add-port=22/tcp
+  - firewall-cmd --permanent --add-port=21/tcp
+  - firewall-cmd --permanent --add-port=30000-30010/tcp
+  - firewall-cmd --reload
+  
+  # Restart SSH service
+  - systemctl restart sshd
+  
+  # Phase 2 script download (from GitHub or Azure Storage)
+  # Option 1: Download from Azure Storage Blob
+  # - curl -o /opt/phase2_scripts.tar.gz "https://yourstorage.blob.core.windows.net/scripts/phase2_scripts.tar.gz"
+  # - tar -xzf /opt/phase2_scripts.tar.gz -C /opt/
+  
+  # Option 2: Include all scripts directly with write_files (continues below)
+  
+  # Phase 2 automatic execution setup (systemd timer)
+  - |
+    cat > /etc/systemd/system/setup-phase2.service <<EOF
+    [Unit]
+    Description=KISA/CSAP Phase 2 Setup
+    After=cloud-final.service network-online.target
+    Wants=network-online.target
+    
+    [Service]
+    Type=oneshot
+    ExecStart=/opt/setup_phase2.sh
+    RemainAfterExit=yes
+    StandardOutput=journal+console
+    StandardError=journal+console
+    
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+  
+  - |
+    cat > /etc/systemd/system/setup-phase2.timer <<EOF
+    [Unit]
+    Description=Run Phase 2 Setup after boot
+    
+    [Timer]
+    OnBootSec=2min
+    Unit=setup-phase2.service
+    
+    [Install]
+    WantedBy=timers.target
+    EOF
+  
+  - systemctl daemon-reload
+  - systemctl enable setup-phase2.timer
+  - systemctl start setup-phase2.timer
+  
+  # Manual execution guide
+  - |
+    cat > /home/azureuser/RUN_PHASE2.md <<EOF
+    # Phase 2 Setup Execution Method
+    
+    ## Automatic Execution
+    Phase 2 will run automatically 2 minutes after system boot.
+    
+    ## Manual Execution
+    To run immediately:
+    \`\`\`bash
+    sudo /opt/setup_phase2.sh
+    \`\`\`
+    
+    ## Status Check
+    \`\`\`bash
+    # Phase 2 execution status
+    sudo systemctl status setup-phase2.service
+    
+    # Check logs
+    sudo tail -f /var/log/phase2-setup.log
+    \`\`\`
+    
+    ## Tasks performed in Phase 2
+    1. Docker installation and security configuration
+    2. FTP server container deployment
+    3. Security tools installation (Fail2ban, AIDE, ClamAV, etc.)
+    4. Compliance check execution
+    5. Monitoring setup
+    EOF
+  
+  - chown azureuser:azureuser /home/azureuser/RUN_PHASE2.md
+  - sh -c 'echo "Phase 1 Completed - $(date)" >> /var/log/cloud-init-phase1.log'
+  - sh -c 'echo "Phase 2 will run automatically after 2 minutes or can be run manually." >> /var/log/cloud-init-phase1.log'
+
+# SSH Configuration (Password authentication allowed in Phase 1)
+ssh_pwauth: true
+disable_root: true
+
+# Final message
+final_message: |
+  Phase 1 setup completed.
+  
+  Phase 2 will start automatically after 2 minutes,
+  or can be run immediately with:
+  sudo /opt/setup_phase2.sh
+  
+  Check progress:
+  - Phase 1 log: /var/log/cloud-init-phase1.log
+  - Phase 2 log: /var/log/phase2-setup.log
